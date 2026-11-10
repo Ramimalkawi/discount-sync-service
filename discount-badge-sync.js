@@ -28,6 +28,8 @@ const PUBLIC_URL = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL;
 
 const BADGE_NS = "custom";
 const BADGE_KEY = "auto_discount_badge";
+const PCT_KEY = "auto_discount_percent"; // number_decimal, automatic discounts only
+const AMT_KEY = "auto_discount_amount"; // number_decimal (shop currency), automatic discounts only
 const STATE_NS = "discount_sync";
 const STATE_KEY = "badged_products"; // shop metafield: JSON map { productGid: badgeText }
 const SYNC_EVERY_MS = 10 * 60 * 1000; // catches discounts that start/end by schedule
@@ -150,7 +152,10 @@ function formatMoney(amount, currency) {
 async function describeDiscount(id) {
   const data = await gql(DETAIL_QUERY, { id });
   const d = data.discountNode && data.discountNode.discount;
-  if (!d || !d.customerGets) return null; // BXGY, free shipping, etc. are skipped
+  if (!d || !d.customerGets) {
+    console.log(`[discount-sync] skipped ${id}: unsupported type ${d ? d.__typename : "none"}`);
+    return null; // BXGY, free shipping, etc. are skipped
+  }
 
   const value = d.customerGets.value;
   let text, pct = 0, amt = 0;
@@ -178,14 +183,16 @@ async function describeDiscount(id) {
       (await fetchCollectionProductIds(c.id)).forEach((pid) => productIds.add(pid));
     }
   } else {
+    console.log(`[discount-sync] skipped ${id} (${d.title}): applies to ${items.__typename}, not specific products/collections`);
     return null; // "all items" discounts are skipped on purpose (no per-product badge)
   }
-  return { productIds: [...productIds], text, pct, amt };
+  return { productIds: [...productIds], text, pct, amt, auto: !code };
 }
 
 // Builds { productGid: badgeText }. If several discounts hit one product, the best one wins.
 async function buildDesiredBadges() {
   const ids = await fetchActiveDiscountIds();
+  console.log(`[discount-sync] active discounts found: ${ids.length}`);
   const best = new Map(); // productId -> { text, pct, amt }
   for (const id of ids) {
     const info = await describeDiscount(id);
@@ -198,7 +205,7 @@ async function buildDesiredBadges() {
     }
   }
   const out = {};
-  for (const [pid, info] of best) out[pid] = info.text;
+  for (const [pid, info] of best) out[pid] = { text: info.text, pct: info.pct, amt: info.amt, auto: info.auto };
   return out;
 }
 
@@ -282,25 +289,36 @@ async function runSync(reason) {
       const desired = await buildDesiredBadges();
       const { shopId, map: previous } = await loadState();
 
-      const toSet = Object.entries(desired)
-        .filter(([pid, text]) => previous[pid] !== text)
-        .map(([pid, text]) => ({
-          ownerId: pid,
-          namespace: BADGE_NS,
-          key: BADGE_KEY,
-          type: "single_line_text_field",
-          value: text,
-        }));
+      const sig = (d) => `${d.text}|${d.pct}|${d.amt}|${d.auto}`;
+      const changed = Object.entries(desired).filter(([pid, d]) => previous[pid] !== sig(d));
 
-      const toClear = Object.keys(previous)
-        .filter((pid) => !(pid in desired))
-        .map((pid) => ({ ownerId: pid, namespace: BADGE_NS, key: BADGE_KEY }));
+      const toSet = [];
+      const toClear = [];
+      const mf = (pid, key, type, value) => ({ ownerId: pid, namespace: BADGE_NS, key, type, value: String(value) });
+      const id = (pid, key) => ({ ownerId: pid, namespace: BADGE_NS, key });
+      for (const [pid, d] of changed) {
+        toSet.push(mf(pid, BADGE_KEY, "single_line_text_field", d.text));
+        if (d.auto && d.pct > 0) {
+          toSet.push(mf(pid, PCT_KEY, "number_decimal", d.pct));
+          toClear.push(id(pid, AMT_KEY));
+        } else if (d.auto && d.amt > 0) {
+          toSet.push(mf(pid, AMT_KEY, "number_decimal", d.amt));
+          toClear.push(id(pid, PCT_KEY));
+        } else {
+          toClear.push(id(pid, PCT_KEY), id(pid, AMT_KEY));
+        }
+      }
+      for (const pid of Object.keys(previous).filter((p) => !(p in desired))) {
+        toClear.push(id(pid, BADGE_KEY), id(pid, PCT_KEY), id(pid, AMT_KEY));
+      }
 
       if (toSet.length) await metafieldsSet(toSet);
       if (toClear.length) await metafieldsDelete(toClear);
-      await saveState(shopId, desired);
+      const nextState = {};
+      for (const [pid, d] of Object.entries(desired)) nextState[pid] = sig(d);
+      await saveState(shopId, nextState);
 
-      console.log(`[discount-sync] done: set ${toSet.length}, cleared ${toClear.length}`);
+      console.log(`[discount-sync] done: updated ${changed.length} products, set ${toSet.length}, cleared ${toClear.length}`);
     } while (pending);
   } catch (err) {
     console.error("[discount-sync] failed:", err.message);
